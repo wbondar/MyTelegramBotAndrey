@@ -3,6 +3,7 @@ import logging
 import random
 import requests
 from datetime import time
+from pytz import timezone
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext, JobQueue
 
@@ -14,8 +15,12 @@ logger = logging.getLogger(__name__)
 OAUTH_TOKEN = os.getenv('OAUTH_TOKEN')  # Токен OAuth
 FOLDER_ID = os.getenv('FOLDER_ID')  # Идентификатор каталога
 TELEGRAM_KEY = os.getenv('TELEGRAM_KEY')  # Токен Telegram-бота
+CHAT_ID = os.getenv('CHAT_ID')  # ID чата, где бот должен отправлять сообщения
 
 API_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+
+# Часовой пояс Москвы
+MSK_TZ = timezone('Europe/Moscow')
 
 # Список случайных сообщений
 AUTOMATIC_MESSAGES = [
@@ -69,7 +74,6 @@ async def process_message(update: Update, context: CallbackContext) -> None:
     user_text = update.message.text
     logger.info(f'Получено сообщение от пользователя: {user_text}')
 
-    # Отправляем сообщение о том, что ответ готовится
     waiting_message = await update.message.reply_text("Не уходи никуда, Умник! Готовлю ответ на твой вопрос...")
 
     iam_token = get_iam_token()
@@ -77,13 +81,11 @@ async def process_message(update: Update, context: CallbackContext) -> None:
         await update.message.reply_text('Ошибка авторизации в Yandex Cloud.')
         return
 
-    # Получаем историю сообщений (20 последних)
     history = context.user_data.get("history", [])
     history.append({"role": "user", "text": user_text})
     if len(history) > MAX_HISTORY:
-        history.pop(0)  # Удаляем старые сообщения
+        history.pop(0)
 
-    # Запрос к Yandex GPT
     data = {
         "modelUri": f"gpt://{FOLDER_ID}/yandexgpt",
         "completionOptions": {"temperature": 0.3, "maxTokens": 1000},
@@ -98,27 +100,22 @@ async def process_message(update: Update, context: CallbackContext) -> None:
         )
         response.raise_for_status()
         result = response.json()
-        logger.info(f'Ответ от Yandex GPT: {result}')
         answer = result.get('result', {}).get('alternatives', [{}])[0].get('message', {}).get('text', 'Ошибка ответа.')
     except requests.RequestException as e:
         logger.error(f'Ошибка при запросе к Yandex GPT: {e}')
         answer = 'Ошибка при обращении к Yandex GPT.'
 
-    # Добавляем ответ бота в историю
     history.append({"role": "assistant", "text": answer})
     if len(history) > MAX_HISTORY:
         history.pop(0)
 
-    # Сохраняем обновленную историю
     context.user_data["history"] = history
-
-    # Удаляем сообщение "Готовлю ответ..." и отправляем ответ
     await waiting_message.delete()
     await update.message.reply_text(answer)
 
 
 async def send_scheduled_message(context: CallbackContext) -> None:
-    """Функция для отправки случайного сообщения в заданное время."""
+    """Отправка случайного сообщения."""
     chat_id = context.job.context
     message = random.choice(AUTOMATIC_MESSAGES)
     await context.bot.send_message(chat_id=chat_id, text=message)
@@ -136,29 +133,19 @@ async def send_night_message(context: CallbackContext) -> None:
     await context.bot.send_message(chat_id=chat_id, text=NIGHT_MESSAGE)
 
 
-async def schedule_messages(update: Update, context: CallbackContext) -> None:
-    """Запуск расписания автоматических сообщений."""
-    chat_id = update.message.chat_id
-    job_queue = context.job_queue
+def schedule_messages(job_queue: JobQueue):
+    """Настройка автоматического расписания."""
+    if not CHAT_ID:
+        logger.error("Ошибка: CHAT_ID не установлен!")
+        return
 
-    # Удаляем старые задания (чтобы не создавать дубликаты)
-    job_queue.scheduler.remove_all_jobs()
+    job_queue.run_daily(send_morning_message, time(hour=8, minute=0, tzinfo=MSK_TZ), context=CHAT_ID)
+    job_queue.run_daily(send_night_message, time(hour=22, minute=0, tzinfo=MSK_TZ), context=CHAT_ID)
 
-    # Запускаем фиксированные сообщения в 8:00 и 22:00
-    job_queue.run_daily(send_morning_message, time(hour=8, minute=0), context=chat_id)
-    job_queue.run_daily(send_night_message, time(hour=22, minute=0), context=chat_id)
-
-    # Запускаем случайные сообщения в 10:00, 12:00, 14:00, 16:00, 18:00, 20:00
     for hour in [10, 12, 14, 16, 18, 20]:
-        job_queue.run_daily(send_scheduled_message, time(hour=hour, minute=0), context=chat_id)
+        job_queue.run_daily(send_scheduled_message, time(hour=hour, minute=0, tzinfo=MSK_TZ), context=CHAT_ID)
 
-    await update.message.reply_text("Расписание сообщений запущено! Теперь бот будет писать в течение дня.")
-
-
-async def send_random_message(update: Update, context: CallbackContext) -> None:
-    """Команда /random для отправки случайного сообщения."""
-    message = random.choice(AUTOMATIC_MESSAGES)
-    await update.message.reply_text(message)
+    return True
 
 
 def main() -> None:
@@ -169,11 +156,11 @@ def main() -> None:
 
     application = Application.builder().token(TELEGRAM_KEY).build()
 
-    # Команды
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("schedule", schedule_messages))  # Запуск расписания
-    application.add_handler(CommandHandler("random", send_random_message))  # Команда /random
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_message))
+
+    if schedule_messages(application.job_queue):
+        application.bot.send_message(chat_id=CHAT_ID, text="Расписание сообщений запущено!")
 
     logger.info("Бот запущен и ожидает сообщения...")
     application.run_polling()
